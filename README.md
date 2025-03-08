@@ -1,4 +1,4 @@
-# Colab-音頻分離
+# Colab-人聲分離
 
 ```python
 import os
@@ -7,9 +7,12 @@ import subprocess
 import time
 import glob
 import shutil
+import random
+import threading
 from pathlib import Path
 from google.colab import files
 from IPython.display import display, Audio, HTML, clear_output
+from tqdm.notebook import tqdm  # 引入tqdm進行進度顯示
 
 class AudioSeparator:
     def __init__(self):
@@ -19,6 +22,18 @@ class AudioSeparator:
         self.mp3_dir = self.output_dir / "mp3_versions"
         self.convert_to_mp3 = True  # 預設啟用MP3轉換
         self.mp3_bitrate = "192k"   # 預設MP3比特率
+        self.setup_keep_alive()     # 初始化時啟動keep_alive線程
+        
+    def setup_keep_alive(self):
+        """設置保持控制台活躍的線程"""
+        def keep_alive():
+            while True:
+                braille_char = chr(random.randint(0x2800, 0x28FF))
+                print(braille_char, end=" ", flush=True)
+                time.sleep(60)  # 每分鐘輸出一次
+                
+        keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+        keep_alive_thread.start()
         
     def show_status(self, message, success=None):
         """顯示帶有圖標的狀態信息"""
@@ -40,12 +55,25 @@ class AudioSeparator:
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                       universal_newlines=True, bufsize=1)
             
-            # 實時顯示輸出
+            # 將輸出重定向到tqdm進行顯示，避免直接print造成進度條問題
+            output_lines = []
             for line in iter(process.stdout.readline, ''):
-                print(line, end='')
+                output_lines.append(line.strip())
+                # 檢查此行是否為進度線
+                if "%" in line and "[" in line and "]" in line:
+                    # 提取百分比
+                    try:
+                        percent = int(float(line.split("%")[0].strip()))
+                        # 使用\r覆蓋當前行來顯示乾淨的進度
+                        tqdm.write(f"\r進度: {percent}% 完成", end="")
+                    except:
+                        tqdm.write(line, end="")
+                else:
+                    tqdm.write(line, end="")
             
             process.stdout.close()
             return_code = process.wait()
+            tqdm.write("")  # 添加換行
             
             if check and return_code != 0:
                 self.show_status(f"命令失敗，返回代碼: {return_code}", False)
@@ -70,7 +98,7 @@ class AudioSeparator:
         os.makedirs(self.temp_dir, exist_ok=True)
         os.makedirs(self.mp3_dir, exist_ok=True)
         
-        # 安裝基本依賴
+        # 安裝基本依賴 (添加tqdm)
         self.show_status("安裝基本音頻處理工具...")
         self.run_command("apt-get update && apt-get install -y ffmpeg libsndfile1", check=False)
         
@@ -79,6 +107,7 @@ class AudioSeparator:
             "torch torchaudio --no-deps",     # PyTorch 和 音頻處理
             "pydub",                          # 通用音頻處理
             "librosa soundfile",              # 高級音頻分析
+            "tqdm",                           # 進度條顯示
         ]
         
         for package in core_packages:
@@ -147,7 +176,34 @@ class AudioSeparator:
             start_time = time.time()
             
             initial_files = set(glob.glob(f"{self.output_dir}/**/*.*", recursive=True))
-            result = self.run_command(model["cmd"], check=False, show_output=True)
+            
+            # 使用進度條顯示
+            with tqdm(total=100, desc=f"{model['name']} 處理進度", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                # 在新線程中更新進度條
+                def update_progress():
+                    last_progress = 0
+                    while pbar.n < 100:
+                        # 根據經過的時間推算進度
+                        elapsed = time.time() - start_time
+                        # 假設處理時間大約需要3分鐘完成
+                        estimated_total_time = 180
+                        progress = min(99, int((elapsed / estimated_total_time) * 100))
+                        if progress > last_progress:
+                            pbar.update(progress - last_progress)
+                            last_progress = progress
+                        time.sleep(1)
+                
+                progress_thread = threading.Thread(target=update_progress)
+                progress_thread.daemon = True
+                progress_thread.start()
+                
+                # 執行命令
+                result = self.run_command(model["cmd"], check=False, show_output=True)
+                
+                # 完成進度條
+                pbar.n = 100
+                pbar.refresh()
+                
             elapsed = time.time() - start_time
             
             # 檢查是否生成了新文件
@@ -189,12 +245,16 @@ class AudioSeparator:
         
         success_count = 0
         
-        for op in operations:
-            self.show_status(f"嘗試 {op['name']}...")
-            result = self.run_command(op["cmd"], check=False)
-            
-            if result:
-                success_count += 1
+        # 使用tqdm顯示總體進度
+        with tqdm(total=len(operations), desc="FFmpeg處理進度") as pbar:
+            for op in operations:
+                self.show_status(f"嘗試 {op['name']}...")
+                result = self.run_command(op["cmd"], check=False)
+                
+                if result:
+                    success_count += 1
+                
+                pbar.update(1)
                 
         if success_count > 0:
             self.show_status(f"FFmpeg 處理成功完成了 {success_count}/{len(operations)} 個操作", True)
@@ -233,45 +293,50 @@ class AudioSeparator:
         converted_files = []
         file_size_comparison = {}
         
-        for source_file in file_list:
-            source_path = Path(source_file)
-            if source_path.suffix.lower() == '.mp3':
-                # 如果已經是MP3，直接複製
-                target_path = self.mp3_dir / source_path.name
-                shutil.copy2(source_file, target_path)
-                converted_files.append(str(target_path))
-                continue
+        # 使用tqdm進度條
+        with tqdm(total=len(file_list), desc="MP3轉換進度") as pbar:
+            for source_file in file_list:
+                source_path = Path(source_file)
+                if source_path.suffix.lower() == '.mp3':
+                    # 如果已經是MP3，直接複製
+                    target_path = self.mp3_dir / source_path.name
+                    shutil.copy2(source_file, target_path)
+                    converted_files.append(str(target_path))
+                    pbar.update(1)
+                    continue
+                    
+                # 創建與原目錄結構相似的子目錄
+                rel_folder = os.path.relpath(os.path.dirname(source_file), str(self.output_dir))
+                if rel_folder != '.':
+                    target_folder = self.mp3_dir / rel_folder
+                    os.makedirs(target_folder, exist_ok=True)
+                else:
+                    target_folder = self.mp3_dir
+                    
+                # 生成MP3文件名
+                target_name = source_path.stem + ".mp3"
+                target_path = target_folder / target_name
                 
-            # 創建與原目錄結構相似的子目錄
-            rel_folder = os.path.relpath(os.path.dirname(source_file), str(self.output_dir))
-            if rel_folder != '.':
-                target_folder = self.mp3_dir / rel_folder
-                os.makedirs(target_folder, exist_ok=True)
-            else:
-                target_folder = self.mp3_dir
+                # 轉換為MP3
+                cmd = f'ffmpeg -y -i "{source_file}" -codec:a libmp3lame -b:a {self.mp3_bitrate} "{target_path}"'
+                result = self.run_command(cmd, check=False)
                 
-            # 生成MP3文件名
-            target_name = source_path.stem + ".mp3"
-            target_path = target_folder / target_name
-            
-            # 轉換為MP3
-            cmd = f'ffmpeg -y -i "{source_file}" -codec:a libmp3lame -b:a {self.mp3_bitrate} "{target_path}"'
-            result = self.run_command(cmd, check=False)
-            
-            if result and os.path.exists(target_path):
-                converted_files.append(str(target_path))
+                if result and os.path.exists(target_path):
+                    converted_files.append(str(target_path))
+                    
+                    # 計算原文件和MP3的大小差異
+                    orig_size = os.path.getsize(source_file) / (1024 * 1024)  # MB
+                    mp3_size = os.path.getsize(target_path) / (1024 * 1024)   # MB
+                    savings = orig_size - mp3_size
+                    savings_percent = (savings / orig_size) * 100 if orig_size > 0 else 0
+                    
+                    file_size_comparison[target_name] = {
+                        'original': f"{orig_size:.2f} MB",
+                        'mp3': f"{mp3_size:.2f} MB",
+                        'savings': f"{savings:.2f} MB ({savings_percent:.1f}%)"
+                    }
                 
-                # 計算原文件和MP3的大小差異
-                orig_size = os.path.getsize(source_file) / (1024 * 1024)  # MB
-                mp3_size = os.path.getsize(target_path) / (1024 * 1024)   # MB
-                savings = orig_size - mp3_size
-                savings_percent = (savings / orig_size) * 100 if orig_size > 0 else 0
-                
-                file_size_comparison[target_name] = {
-                    'original': f"{orig_size:.2f} MB",
-                    'mp3': f"{mp3_size:.2f} MB",
-                    'savings': f"{savings:.2f} MB ({savings_percent:.1f}%)"
-                }
+                pbar.update(1)
             
         # 顯示總體節省情況
         if converted_files:
