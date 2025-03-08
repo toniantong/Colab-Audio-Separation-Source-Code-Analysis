@@ -425,26 +425,34 @@ class AudioSeparator:
     
     def configure_mp3_settings(self):
         """配置MP3轉換設置"""
+    def configure_mp3_settings(self):
+        """配置MP3轉換設置"""
         print("\n===== MP3 轉換設置 =====")
         print("將輸出文件轉換為MP3可顯著減少文件大小，加快下載速度。")
-        
+    
         convert_input = input("是否要轉換為MP3格式? (y/n，默認: y): ").strip().lower()
         self.convert_to_mp3 = convert_input != "n"  # 預設啟用
-        
+    
         if self.convert_to_mp3:
             print("\n可用的MP3比特率:")
             print("  - 128k (較小文件，較低音質)")
             print("  - 192k (平衡大小與音質)")
             print("  - 256k (較好音質，較大文件)")
             print("  - 320k (最高音質，最大文件)")
-            
+        
             bitrate_input = input("選擇MP3比特率 (默認: 192k): ").strip().lower()
+        
+            # 修正：自動添加"k"如果用戶只輸入了數字
+            if bitrate_input and not bitrate_input.endswith('k'):
+                bitrate_input = bitrate_input + 'k'
+            
             valid_bitrates = ["128k", "192k", "256k", "320k"]
             self.mp3_bitrate = bitrate_input if bitrate_input in valid_bitrates else "192k"
-            
+        
             print(f"已設置轉換為MP3，比特率: {self.mp3_bitrate}")
         else:
             print("將使用原始音頻格式（可能較大）")
+
     
     def run_workflow(self):
         """執行完整工作流"""
