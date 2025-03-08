@@ -16,6 +16,9 @@ class AudioSeparator:
         self.root_dir = Path("/content")
         self.output_dir = self.root_dir / "separated_audio"
         self.temp_dir = self.root_dir / "temp_audio"
+        self.mp3_dir = self.output_dir / "mp3_versions"
+        self.convert_to_mp3 = True  # 預設啟用MP3轉換
+        self.mp3_bitrate = "192k"   # 預設MP3比特率
         
     def show_status(self, message, success=None):
         """顯示帶有圖標的狀態信息"""
@@ -65,6 +68,7 @@ class AudioSeparator:
         # 創建目錄
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.temp_dir, exist_ok=True)
+        os.makedirs(self.mp3_dir, exist_ok=True)
         
         # 安裝基本依賴
         self.show_status("安裝基本音頻處理工具...")
@@ -219,6 +223,68 @@ class AudioSeparator:
         # 都失敗了
         self.show_status(f"無法處理文件: {Path(input_file).name}", False)
         return False
+
+    def convert_files_to_mp3(self, file_list):
+        """將列表中的文件轉換為MP3格式"""
+        if not self.convert_to_mp3:
+            return [], {}
+            
+        self.show_status(f"開始轉換文件為MP3格式 (比特率: {self.mp3_bitrate})...")
+        converted_files = []
+        file_size_comparison = {}
+        
+        for source_file in file_list:
+            source_path = Path(source_file)
+            if source_path.suffix.lower() == '.mp3':
+                # 如果已經是MP3，直接複製
+                target_path = self.mp3_dir / source_path.name
+                shutil.copy2(source_file, target_path)
+                converted_files.append(str(target_path))
+                continue
+                
+            # 創建與原目錄結構相似的子目錄
+            rel_folder = os.path.relpath(os.path.dirname(source_file), str(self.output_dir))
+            if rel_folder != '.':
+                target_folder = self.mp3_dir / rel_folder
+                os.makedirs(target_folder, exist_ok=True)
+            else:
+                target_folder = self.mp3_dir
+                
+            # 生成MP3文件名
+            target_name = source_path.stem + ".mp3"
+            target_path = target_folder / target_name
+            
+            # 轉換為MP3
+            cmd = f'ffmpeg -y -i "{source_file}" -codec:a libmp3lame -b:a {self.mp3_bitrate} "{target_path}"'
+            result = self.run_command(cmd, check=False)
+            
+            if result and os.path.exists(target_path):
+                converted_files.append(str(target_path))
+                
+                # 計算原文件和MP3的大小差異
+                orig_size = os.path.getsize(source_file) / (1024 * 1024)  # MB
+                mp3_size = os.path.getsize(target_path) / (1024 * 1024)   # MB
+                savings = orig_size - mp3_size
+                savings_percent = (savings / orig_size) * 100 if orig_size > 0 else 0
+                
+                file_size_comparison[target_name] = {
+                    'original': f"{orig_size:.2f} MB",
+                    'mp3': f"{mp3_size:.2f} MB",
+                    'savings': f"{savings:.2f} MB ({savings_percent:.1f}%)"
+                }
+            
+        # 顯示總體節省情況
+        if converted_files:
+            total_orig = sum(os.path.getsize(f) for f in file_list) / (1024 * 1024)
+            total_mp3 = sum(os.path.getsize(f) for f in converted_files) / (1024 * 1024)
+            total_savings = total_orig - total_mp3
+            savings_percent = (total_savings / total_orig) * 100 if total_orig > 0 else 0
+            
+            self.show_status(f"MP3轉換完成! 從 {total_orig:.2f} MB 減小到 {total_mp3:.2f} MB，節省 {total_savings:.2f} MB ({savings_percent:.1f}%)", True)
+        else:
+            self.show_status("沒有文件可以轉換為MP3", False)
+            
+        return converted_files, file_size_comparison
     
     def preview_audio(self, file_path):
         """顯示音頻預覽"""
@@ -243,17 +309,32 @@ class AudioSeparator:
         if not output_files:
             self.show_status("未找到輸出文件", False)
             return False
+            
+        # 是否轉換為MP3
+        if self.convert_to_mp3:
+            mp3_files, size_comparison = self.convert_files_to_mp3(output_files)
+            
+            # 如果MP3轉換成功，使用MP3文件
+            if mp3_files:
+                self.show_status("將使用MP3版本進行下載 (較小的檔案大小)", True)
+                download_files = mp3_files
+            else:
+                self.show_status("MP3轉換失敗，使用原始文件", False)
+                download_files = output_files
+        else:
+            self.show_status("使用原始格式文件", True)
+            download_files = output_files
         
         # 按目錄分組
         files_by_folder = {}
-        for file_path in output_files:
+        for file_path in download_files:
             folder = os.path.dirname(file_path)
             if folder not in files_by_folder:
                 files_by_folder[folder] = []
             files_by_folder[folder].append(file_path)
         
         # 顯示和下載
-        self.show_status(f"找到 {len(output_files)} 個輸出文件（{len(files_by_folder)} 個分組）", True)
+        self.show_status(f"找到 {len(download_files)} 個輸出文件（{len(files_by_folder)} 個分組）", True)
         
         for folder, files_list in files_by_folder.items():
             folder_name = os.path.basename(folder)
@@ -263,7 +344,11 @@ class AudioSeparator:
                 file_name = os.path.basename(file_path)
                 file_size = os.path.getsize(file_path) / (1024 * 1024)
                 
-                print(f"  - 📄 {file_name} ({file_size:.2f} MB)")
+                size_info = f"({file_size:.2f} MB)"
+                if self.convert_to_mp3 and file_name in size_comparison:
+                    size_info += f" - 節省: {size_comparison[file_name]['savings']}"
+                
+                print(f"  - 📄 {file_name} {size_info}")
                 
                 if preview:
                     self.preview_audio(file_path)
@@ -272,6 +357,29 @@ class AudioSeparator:
                 files.download(file_path)
                 
         return True
+    
+    def configure_mp3_settings(self):
+        """配置MP3轉換設置"""
+        print("\n===== MP3 轉換設置 =====")
+        print("將輸出文件轉換為MP3可顯著減少文件大小，加快下載速度。")
+        
+        convert_input = input("是否要轉換為MP3格式? (y/n，默認: y): ").strip().lower()
+        self.convert_to_mp3 = convert_input != "n"  # 預設啟用
+        
+        if self.convert_to_mp3:
+            print("\n可用的MP3比特率:")
+            print("  - 128k (較小文件，較低音質)")
+            print("  - 192k (平衡大小與音質)")
+            print("  - 256k (較好音質，較大文件)")
+            print("  - 320k (最高音質，最大文件)")
+            
+            bitrate_input = input("選擇MP3比特率 (默認: 192k): ").strip().lower()
+            valid_bitrates = ["128k", "192k", "256k", "320k"]
+            self.mp3_bitrate = bitrate_input if bitrate_input in valid_bitrates else "192k"
+            
+            print(f"已設置轉換為MP3，比特率: {self.mp3_bitrate}")
+        else:
+            print("將使用原始音頻格式（可能較大）")
     
     def run_workflow(self):
         """執行完整工作流"""
@@ -282,6 +390,9 @@ class AudioSeparator:
             self.show_status("環境設置失敗，無法繼續", False)
             return False
             
+        # 配置MP3轉換設置
+        self.configure_mp3_settings()
+        
         # 上傳文件
         self.show_status("請上傳音頻文件 (支持 .mp3, .wav, .flac 等格式)...")
         uploaded = files.upload()
@@ -317,4 +428,5 @@ class AudioSeparator:
 # 執行工作流程
 processor = AudioSeparator()
 processor.run_workflow()
+
 ```
